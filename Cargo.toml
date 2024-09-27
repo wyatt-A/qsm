@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ndarray = "0.16.1"
-ndarray-linalg = { version = "0.16", features = ["openblas-system"] }
+ndarray = "0.15.6"
+ndarray-linalg = { version = "0.15", features = ["openblas-system"] }
 fft = {path = "../civm_scan/fft"}
+num-complex = "0.4.4"

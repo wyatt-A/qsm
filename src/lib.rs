@@ -1,17 +1,19 @@
 use ndarray::{Array1, Array2, Array3, Array4, ArrayD, Axis, ShapeBuilder};
-
+use num_complex::Complex32;
 
 
 #[cfg(test)]
 mod tests {
+    use core::f32;
+
     use super::*;
-    use ndarray::ShapeBuilder;
+    use ndarray::{Ix3, ShapeBuilder};
+    use ndarray_linalg::Scalar;
 
     #[test]
     fn it_works() {
-
         // some noise added
-        
+    
         let b = Array1::from_vec(vec![39.5327,0.4491,108.8172,5.1854]);
         let x_gt = Array1::from_vec(vec![1.,2.,3.,4.]);
         let x0 = Array1::from_vec(vec![0.,0.,0.,0.]);
@@ -20,12 +22,76 @@ mod tests {
         let a = MatrixOp {
             a:Array2::from_shape_vec((4,4), a_entries).unwrap()
         };
-
-
         cgsolve(&a, &b, x0, 0.);
+    }
+
+
+    #[test]
+    fn medi_prototype() {
+
+        let matrix_size = [400,342,341];
+        let voxel_size = [1f32,1f32,1f32];
+
+        let mut noise_std = Array3::<f32>::zeros(matrix_size.f());
+        let mask = Array3::<bool>::from_elem(matrix_size.f(),true);
+        let rdf = Array3::<f32>::zeros(matrix_size.f());
+        let magnitude = Array3::<f32>::zeros(matrix_size.f());
+
+
+        // dc at the origin
+        let dipole_kern = fft::conv_kernels::dipole_kernel_3d(matrix_size, [0.,0.,1.], voxel_size);
+
+        // apply mask to noise array
+        noise_std *= &mask.map(|&x| if x {1.} else {0.});
+
+
+        let m = snr_weigting(&mask, &noise_std);
+        let b0 = rdf.map(|&phase| Complex32::from_polar(1., phase)) * m;
+        let wG = gradient_weighting(&magnitude, &mask, voxel_size, 0.9);
+
+
+        let iter = 0;
+        // iter=0;
+
+        let mut x = Array3::<f32>::zeros(matrix_size.f());
+        // x = zeros(matrix_size); %real(ifftn(conj(D).*fftn((abs(m).^2).*RDF)));
+
+        let mut res_norm_ratio = f32::INFINITY;
+        // res_norm_ratio = Inf;
+
+        let mut cost_data_history:Vec<f32> = vec![];
+        let mut cost_reg_history:Vec<f32> = vec![];
+        // cost_data_history = zeros(1,max_iter);
+        // cost_reg_history = zeros(1,max_iter);
+        
+        let eps = 0.000001;
+        // e=0.000001; %a very small number to avoid /0
+
+        let mut badpoint = Array3::<bool>::from_elem(matrix_size.f(), false);
+        // badpoint = zeros(matrix_size);
+
+        let dipole_conv = |x:&Array3<f32>| {
+            let mut x = x.map(|&x| Complex32::new(x, 0.)).into_dyn();
+            fft::fftn(&mut x);
+            x *= &dipole_kern;
+            fft::ifftn(&mut x);
+            x.map(|x|x.re()).into_dimensionality::<Ix3>().unwrap()
+        };
+        // Dconv = @(dx) real(ifftn(D.*fftn(dx)));
+        // optimization loop
+        while true {
+
+        }
+
 
 
     }
+
+
+
+
+
+
 }
 
 struct MatrixOp {
@@ -114,7 +180,7 @@ fn dot(a:&Array1<f32>,b:&Array1<f32>) -> f32 {
 
 /// returns a weighting mask based on a noise map of the image, where the noise level is expressed as
 /// the standard deviation
-fn snr_weigting(mask:&ArrayD<bool>,noise_std_map:&Array3<f32>) -> Array3<f32> {
+fn snr_weigting(mask:&Array3<bool>,noise_std_map:&Array3<f32>) -> Array3<f32> {
 
     let mut w = 1./noise_std_map;
 
@@ -184,6 +250,40 @@ fn test_fgrad() {
 
 }
 
+/// backward divergence
+fn bdiv(grad:&Array4<f32>,voxel_size:[f32;3],dst:&mut Array3<f32>) {
+
+    dst.mapv_inplace(|_|0.);
+
+    for axis_idx in 0..3 {
+    
+        let g = grad.index_axis(Axis(3), axis_idx);
+
+        dst.lanes_mut(Axis(axis_idx)).into_iter().zip(g.lanes(Axis(axis_idx))).for_each(|(mut x,y)|{
+
+            y.iter().enumerate().zip(x.iter_mut()).for_each(|((i,_),x)|{
+
+                // Dirichlet boundary condition
+                let bdiv = if i == 0 {
+                    y[i]
+                }else if i == y.len() - 1 {
+                    0. - y[i-1]
+                }else {
+                    y[i] - y[i-1]
+                };
+
+                *x += bdiv / voxel_size[axis_idx];
+
+            });
+
+        });
+
+        dst.mapv_inplace(|x| -x);
+
+    }
+
+}
+
 
 /// returns a  mask of edges or its inverse (not sure)
 fn gradient_weighting(magnitude:&Array3<f32>, mask:&Array3<bool>, voxel_size:[f32;3], edge_voxel_percentage:f32) -> Array4<bool> {
@@ -232,32 +332,3 @@ fn gradient_weighting(magnitude:&Array3<f32>, mask:&Array3<bool>, voxel_size:[f3
     grad.map(|&x| x <= field_noise_level)
 
 }
-
-/*
-
-function wG=gradient_mask(gradient_weighting_mode, iMag, Mask, grad, voxel_size, percentage)
-
-if nargin < 6
-    percentage = 0.9;
-end
-
-
-field_noise_level = 0.01*max(iMag(:));
-wG = abs(grad(iMag.*(Mask>0), voxel_size));
-denominator = sum(Mask(:)==1);
-numerator = sum(wG(:)>field_noise_level);
-if  (numerator/denominator)>percentage
-    while (numerator/denominator)>percentage
-        field_noise_level = field_noise_level*1.05;
-        numerator = sum(wG(:)>field_noise_level);
-    end
-else
-    while (numerator/denominator)<percentage
-        field_noise_level = field_noise_level*.95;
-        numerator = sum(wG(:)>field_noise_level);
-    end
-end
-
-wG = (wG<=field_noise_level);
-
-*/
