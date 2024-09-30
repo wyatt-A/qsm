@@ -1,9 +1,12 @@
 use std::{path::Path, time::Instant};
 
-use ndarray::{Array1, Array2, Array3, Array4, ArrayD, AssignElem, Axis, Ix3, ShapeBuilder};
+use fft::conv_kernels::dipole_kernel_3d;
+use ndarray::{concatenate, parallel::prelude::{IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator}, s, Array1, Array2, Array3, Array4, ArrayD, AssignElem, Axis, Ix3, Ix4, ShapeBuilder};
 use ndarray_linalg::Scalar;
 use nifti::{writer::WriterOptions, IntoNdArray, NiftiObject, ReaderOptions};
 use num_complex::{Complex32};
+use rayon::slice::ParallelSliceMut;
+use rustfft::FftPlanner;
 
 
 #[cfg(test)]
@@ -31,30 +34,30 @@ mod tests {
         cgsolve(&a, &b, x0, 0.);
     }
 
-
+    //cargo test --package qsm --lib -- tests::medi_prototype --exact --nocapture
     #[test]
     fn medi_prototype() {
 
-        let matrix_size = [400,342,341];
+        let matrix_size = [590,360,360];
         let voxel_size = [1f32,1f32,1f32];
-        let lambda = 100.;
+        let lambda = 1000.;
         let delta_te = 5e-3; // 5 ms
         let center_freq = 300e6; // 300 MHz
         let tol_norm_ratio = 0.1;
-        let max_iter = 10;
+        let max_iter = 1;
         let cg_tol = 0.01;
-        let cg_max_iter = 10;
+        let cg_max_iter = 5;
 
-        let mut noise_std = Array3::<f32>::zeros(matrix_size.f());
-        let mask = Array3::<bool>::from_elem(matrix_size.f(),true);
-        let rdf = Array3::<f32>::zeros(matrix_size.f());
-        let magnitude = Array3::<f32>::zeros(matrix_size.f());
+        let magnitude = read_nifti_f32("/home/wyatt/test_data/qsm_test/magnitude.nii");
+        let mask = read_nifti_f32("/home/wyatt/test_data/qsm_test/mask_eroded.nii").map(|x|x.is_normal());
+        let rdf = read_nifti_f32("/home/wyatt/test_data/qsm_test/relative_difference_field3.nii");
+        let mut noise_std = read_nifti_f32("/home/wyatt/test_data/qsm_test/error_estimate.nii");
 
         // dc at the origin
         let dipole_kern = fft::conv_kernels::dipole_kernel_3d(matrix_size, [0.,0.,1.], voxel_size);
 
         // apply mask to noise array
-        noise_std *= &mask.map(|&x| if x {1.} else {0.});
+        apply_mask3d(&mut noise_std, &mask);
 
         let m = snr_weigting(&mask, &noise_std);
         let b0 = rdf.map(|&phase| Complex32::from_polar(1., phase)) * &m;
@@ -66,7 +69,6 @@ mod tests {
         // primary iterate for chi
         let mut x = Array3::<f32>::zeros(matrix_size.f());
 
-        let mut fft_tmp = ArrayD::<Complex32>::zeros(matrix_size.as_slice().f());
         // x = zeros(matrix_size); %real(ifftn(conj(D).*fftn((abs(m).^2).*RDF)));
 
         let mut res_norm_ratio = f32::INFINITY;
@@ -138,7 +140,7 @@ mod tests {
         x.mapv_inplace(|x|x * scale);
 
 
-        let result = x;
+        write_nifti("/home/wyatt/test_data/qsm_test/rust_outputs/chi.nii", &x);
 
     }
 
@@ -156,17 +158,58 @@ fn reg(dx:&Array3<f32>,w_g:&Array4<bool>,vr:&Array4<f32>,matrix_size:[usize;3],v
     bdiv_out
 }
 
+#[test]
+fn test_reg() {
+
+    let matrix_size = [590,360,360];
+    let voxel_size = [1.,1.,1.];
+    let eps = 0.000001;
+
+    let x = read_nifti_f32("/home/wyatt/test_data/qsm_test/x_test.nii");
+    let w_g = read_nifti_f32_4d("/home/wyatt/test_data/qsm_test/w_g.nii").map(|x| x.is_normal());
+
+
+    let vr = calc_vr(&x, &w_g, matrix_size, voxel_size, eps);
+
+    let now = Instant::now();
+    let reg = reg(&x,&w_g,&vr,matrix_size,voxel_size);
+    let dur = now.elapsed().as_millis();
+
+    println!("took {} ms",dur);
+
+    write_nifti("/home/wyatt/test_data/qsm_test/rust_outputs/reg.nii", &reg);
+}
+
 //fidelity = @(dx)Dconv(conj(w).*w.*Dconv(dx) );
 fn fidelity(dx:&Array3<f32>,w:&Array3<Complex32>,dipole_kern:&Array3<Complex32>) -> Array3<f32> {
     dipole_conv(
-        &(w.map(|x|x.conj()) * w * dipole_conv(dx,dipole_kern)).map(|x|x.re()),
+        &(w.map(|x|x.norm_sqr()) * dipole_conv(dx,dipole_kern)).map(|x|x.re()),
         dipole_kern
     )
 }
 
+#[test]
+fn test_fidelity() {
+
+    let x = read_nifti_f32("/home/wyatt/test_data/qsm_test/x_test.nii");
+    let m = read_nifti_f32("/home/wyatt/test_data/qsm_test/m.nii");
+    let d = dipole_kernel_3d([590,360,360], [0.,0.,1.], [1.,1.,1.]);
+    let w = calc_w(&x, &m, &d);
+
+    let now = Instant::now();
+    let f = fidelity(&x, &w, &d);
+    let dur = now.elapsed().as_millis();
+
+    println!("took {} ms",dur);
+
+    write_nifti("/home/wyatt/test_data/qsm_test/rust_outputs/fidel.nii", &f);
+
+}
+
+
 // Dconv = @(dx) real(ifftn(D.*fftn(dx)));
 fn dipole_conv(x:&Array3<f32>,dipole_kern:&Array3<Complex32>) -> Array3<f32> {
-    let mut x = x.map(|&x|Complex32::from_real(x)).into_dyn();
+    let mut x = x.map(|x|Complex32::from_real(*x)).into_dyn();
     fft::fftn(&mut x);
     x *= dipole_kern;
     fft::ifftn(&mut x);
@@ -176,19 +219,58 @@ fn dipole_conv(x:&Array3<f32>,dipole_kern:&Array3<Complex32>) -> Array3<f32> {
 fn calc_vr(x:&Array3<f32>,w_g:&Array4<bool>,matrix_size:[usize;3],voxel_size:[f32;3],eps:f32) -> Array4<f32> {
     let mut tmp = Array4::<f32>::zeros((matrix_size[0],matrix_size[1],matrix_size[2],3).f());
     tmp.mapv_inplace(|_| 0.);
-    fgrad(&x.map(|x|x.re()), &mut tmp, voxel_size);
+    fgrad(&x, &mut tmp, voxel_size);
     apply_mask4d(&mut tmp, w_g);
-    tmp.mapv_inplace(|x| 1. / (x.abs().powi(2) + eps).sqrt());
+    tmp.par_mapv_inplace(|x| 1. / (x.abs().powi(2) + eps).sqrt());
+    //tmp.mapv_inplace(|x| 1. / (x.abs().powi(2) + eps).sqrt());
     return tmp;
 }
 
+#[test]
+fn test_calc_vr() {
+
+    let matrix_size = [590,360,360];
+    let voxel_size = [1.,1.,1.];
+    let eps = 0.000001;
+
+    let x = read_nifti_f32("/home/wyatt/test_data/qsm_test/x_test.nii");
+    let w_g = read_nifti_f32_4d("/home/wyatt/test_data/qsm_test/w_g.nii").map(|x| x.is_normal());
+    
+    let now = Instant::now();
+    let vr = calc_vr(&x, &w_g, matrix_size, voxel_size, eps);
+    let dur = now.elapsed().as_millis();
+
+    println!("took {} ms",dur);
+
+    write_nifti4d("/home/wyatt/test_data/qsm_test/rust_outputs/vr.nii", &vr);
+
+}
+
+
 fn calc_w(x:&Array3<f32>,m:&Array3<f32>,dipole_kern:&Array3<Complex32>) -> Array3<Complex32> {
-    let mut tmp = ArrayD::<Complex32>::zeros(x.shape());
-    tmp.assign(&x.map(|&x|Complex32::from_real(x)));
+    let mut tmp = x.map(|&x|Complex32::from_real(x)).into_dyn();
+    let now = Instant::now();
     fft::fftn(&mut tmp);
+    let dur = now.elapsed().as_millis();
+    println!("fft took {} ms",dur);
     tmp *= dipole_kern;
     fft::ifftn(&mut tmp);
-    (&tmp.map(|&x| (x * Complex32::I).exp()) * m).into_dimensionality::<Ix3>().unwrap()
+    tmp.par_map_inplace(|x|{
+        *x = (*x * Complex32::I).exp()
+    });
+    m * tmp.into_dimensionality::<Ix3>().unwrap()
+}
+
+#[test]
+fn calc_w_test() {
+    let x = read_nifti_f32("/home/wyatt/test_data/qsm_test/x_test.nii");
+    let m = read_nifti_f32("/home/wyatt/test_data/qsm_test/m.nii");
+    let d = dipole_kernel_3d([590,360,360], [0.,0.,1.], [1.,1.,1.]);
+    let now = Instant::now();
+    let w = calc_w(&x, &m, &d);
+    let dur = now.elapsed().as_millis();
+    println!("took {} ms",dur);
+    write_nifti("/home/wyatt/test_data/qsm_test/rust_outputs/w.nii", &w.map(|x|x.to_polar().1));
 }
 
 fn calc_w_res(x:&Array3<f32>,m:&Array3<f32>,b0:&Array3<Complex32>,dipole_kern:&Array3<Complex32>) -> Array3<Complex32> {
@@ -209,7 +291,25 @@ fn calc_reg_cost(x:&Array3<f32>,w_g:&Array4<bool>,matrix_size:[usize;3],voxel_si
 }
 
 fn apply_mask4d(x:&mut Array4<f32>, mask:&Array4<bool>) {
-    *x *= &mask.map(|&x| if x {1.} else {0.});
+    //*x *= &mask.map(|&x| if x {1.} else {0.});
+    x.as_slice_memory_order_mut().unwrap().par_iter_mut().zip(
+        mask.as_slice_memory_order().unwrap().par_iter()
+    ).for_each(|(x,&m)|{
+        if !m {
+            *x = 0.;
+        }
+    });
+}
+
+fn apply_mask3d(x:&mut Array3<f32>, mask:&Array3<bool>) {
+    //*x *= &mask.map(|&x| if x {1.} else {0.});
+    x.as_slice_memory_order_mut().unwrap().par_iter_mut().zip(
+        mask.as_slice_memory_order().unwrap().par_iter()
+    ).for_each(|(x,&m)|{
+        if !m {
+            *x = 0.;
+        }
+    });
 }
 
 
@@ -246,6 +346,8 @@ where A: Fn(&Array3<f32>) -> Array3<f32>{
     let mut k = 0;
 
     while k < max_iter &&  delta > tol * tol * delta0 {
+        println!("cg iter {}",k);
+        let now = Instant::now();
         let ap = a(&p);
         delta = normsq3(&r);
         let alpha = delta / dot3(&p,&ap);
@@ -254,10 +356,11 @@ where A: Fn(&Array3<f32>) -> Array3<f32>{
         let beta = normsq3(&r) / delta;
         p = &r + beta * p;
         k += 1;
+        let dur = now.elapsed().as_millis();
+        println!("cg iter took {} ms",dur);
     }
     return x
 }
-
 
 
 
@@ -366,7 +469,7 @@ fn test_snr_weighting() {
 
 /// discrete gradient operator over x. writes result to 4-D dst array where the last dimension is
 /// Gx, Gy, Gz
-fn fgrad(x:&Array3<f32>,dst:&mut Array4<f32>, voxel_size:[f32;3]) {
+fn _fgrad(x:&Array3<f32>,dst:&mut Array4<f32>, voxel_size:[f32;3]) {
 
     // set dst to 0
     dst.mapv_inplace(|_| 0.);   
@@ -388,6 +491,35 @@ fn fgrad(x:&Array3<f32>,dst:&mut Array4<f32>, voxel_size:[f32;3]) {
     }
 }
 
+fn fgrad(x:&Array3<f32>,dst:&mut Array4<f32>, voxel_size:[f32;3]) {
+
+    let (mx,my,mz) = (x.shape()[0],x.shape()[1],x.shape()[2]);
+
+    dst.slice_mut(s![0..mx-1,..,..,0])
+    .assign(&(&x.slice(s![1..mx,..,..]) - &x.slice(s![0..mx-1,..,..])));
+    dst.slice_mut(s![mx-1,..,..,0])
+    .fill(0.);
+    let mut gx = dst.slice_mut(s![..,..,..,0]);
+    gx /= voxel_size[0];
+
+    dst.slice_mut(s![..,0..my-1,..,1])
+    .assign(&(&x.slice(s![..,1..my,..]) - &x.slice(s![..,0..my-1,..])));
+    dst.slice_mut(s![..,my-1,..,1])
+    .fill(0.);
+    let mut gy = dst.slice_mut(s![..,..,..,1]);
+    gy /= voxel_size[1];
+
+    dst.slice_mut(s![..,..,0..mz-1,2])
+    .assign(&(&x.slice(s![..,..,1..mz]) - &x.slice(s![..,..,0..mz-1])));
+    dst.slice_mut(s![..,..,mz-1,2])
+    .fill(0.);
+    let mut gz = dst.slice_mut(s![..,..,..,2]);
+    gz /= voxel_size[2];
+
+}
+
+
+
 #[test]
 fn test_fgrad() {
 
@@ -407,49 +539,59 @@ fn test_fgrad() {
 /// backward divergence
 fn bdiv(grad:&Array4<f32>,voxel_size:[f32;3],dst:&mut Array3<f32>) {
 
-    dst.mapv_inplace(|_|0.);
+    // Extract Gx_x, Gx_y, Gx_z (these are 3D slices of the 4D array grad)
+    let gx = grad.slice(s![.., .., .., 0]);
+    let gy = grad.slice(s![.., .., .., 1]);
+    let gz = grad.slice(s![.., .., .., 2]);
 
-    for axis_idx in 0..3 {
-    
-        let g = grad.index_axis(Axis(3), axis_idx);
+    let (mx, my, mz) = (gx.shape()[0], gx.shape()[1], gx.shape()[2]);
 
-        dst.lanes_mut(Axis(axis_idx)).into_iter().zip(g.lanes(Axis(axis_idx))).for_each(|(mut x,y)|{
+    // Initialize Dx, Dy, Dz
+    let mut dx = Array3::<f32>::zeros((mx, my, mz).f());
+    let mut dy = Array3::<f32>::zeros((mx, my, mz).f());
+    let mut dz = Array3::<f32>::zeros((mx, my, mz).f());
 
-            y.iter().enumerate().zip(x.iter_mut()).for_each(|((i,_),x)|{
+    // Compute Dx: backward difference in the x direction
+    dx.slice_mut(s![1..mx-1, .., ..])
+        .assign(&(&gx.slice(s![1..mx-1,..,..,]) - &gx.slice(s![0..mx-2,..,..,])));
+    dx.slice_mut(s![0,..,..]).assign(&gx.slice(s![0,..,..,]));
+    dx.slice_mut(s![mx-1,..,..]).assign(&-&gx.slice(s![mx-2,..,..,]));
+    dx /= voxel_size[0];
 
-                // Dirichlet boundary condition
-                let bdiv = if i == 0 {
-                    y[i]
-                }else if i == y.len() - 1 {
-                    0. - y[i-1]
-                }else {
-                    y[i] - y[i-1]
-                };
+    // Compute Dy: backward difference in the y direction
+    dy.slice_mut(s![.., 1..my-1, ..])
+        .assign(&(&gy.slice(s![..,1..my-1,..,]) - &gy.slice(s![..,0..my-2,..,])));
+    dy.slice_mut(s![..,0,..]).assign(&gy.slice(s![..,0,..,]));
+    dy.slice_mut(s![..,my-1,..]).assign(&-&gy.slice(s![..,my-2,..,]));
+    dy /= voxel_size[1];
 
-                *x += bdiv / voxel_size[axis_idx];
+    // Compute Dz: backward difference in the z direction
+    dz.slice_mut(s![.., .., 1..mz-1])
+        .assign(&(&gz.slice(s![..,..,1..mz-1]) - &gz.slice(s![..,..,0..mz-2])));
+    dz.slice_mut(s![..,..,0]).assign(&gz.slice(s![..,..,0]));
+    dz.slice_mut(s![..,..,mz-1]).assign(&-&gz.slice(s![..,..,mz-2]));
+    dz /= voxel_size[2];
 
-            });
-
-        });
-
-        dst.mapv_inplace(|x| -x);
-
-    }
+    // Compute the divergence and assign to dst
+    dst.assign(&-(dx + dy + dz));
 
 }
+
 
 #[test]
 fn test_bdiv() {
-    let magnitude = read_nifti_f32("/Users/Wyatt/scratch/qsm_work/test_inputs/magnitude.nii");
-    let dims = magnitude.shape().to_vec();
-    let mut result = Array3::<f32>::zeros((dims[0],dims[1],dims[2]).f());
-    let mut grad = Array4::zeros((dims[0],dims[1],dims[2], 3).f());
-    fgrad(&magnitude, &mut grad, [1.,1.,1.]);
-    write_nifti4d("/Users/Wyatt/scratch/qsm_work/test_inputs/rust_outputs/fgrad",&grad);
-    bdiv(&grad, [1.,1.,1.], &mut result);
-    write_nifti("/Users/Wyatt/scratch/qsm_work/test_inputs/rust_outputs/bdiv",&result);
+    let input = "/home/wyatt/test_data/qsm_test/matlab_outputs/fgrad.nii";
+    let input = read_nifti_f32_4d(input);
+    //println!("{:?}",input.slice(s![..,..,1,0]));
+    let s = input.shape();
+    let mut result = Array3::zeros((s[0],s[1],s[2]).f());
+    let now = Instant::now();
+    bdiv(&input, [1.,1.,1.], &mut result);
+    let dur = now.elapsed().as_millis();
+    write_nifti("/home/wyatt/test_data/qsm_test/rust_outputs/bdiv_out",&result);
+    //println!("{:#?}",result.as_slice_memory_order().unwrap());
+    println!("took {} ms",dur);
 }
-
 
 
 /// returns a  mask of edges or its inverse (not sure)
@@ -464,7 +606,6 @@ fn gradient_weighting(magnitude:&Array3<f32>, mask:&Array3<bool>, voxel_size:[f3
 
     let dims = magnitude.shape();
 
-
     let mut grad = Array4::zeros((dims[0],dims[1],dims[2], 3).f());
 
     let now = Instant::now();
@@ -474,14 +615,23 @@ fn gradient_weighting(magnitude:&Array3<f32>, mask:&Array3<bool>, voxel_size:[f3
 
     grad.mapv_inplace(|x| x.abs());
 
-    let denominator = mask.iter().fold(0f32, |acc,&x| if x {acc + 1.} else {acc} );
+    //let denominator = mask.iter().fold(0f32, |acc,&x| if x {acc + 1.} else {acc} );
+    let denominator = mask.as_slice_memory_order().unwrap()
+    .par_iter().filter(|&&x| x).count() as f32;
 
     let grad_above_noise = |grad:&Array4<f32>,field_noise:f32| {
-        grad.map(|&x| if x > field_noise {1.} else {0.}).sum()
+        grad.as_slice_memory_order()
+        .unwrap()
+        .par_iter()
+        .filter(|&&x| x > field_noise)
+        .count() as f32
     };
 
     let mut iter = 0;
+    let now = Instant::now();
     let mut numerator = grad_above_noise(&grad,field_noise_level);
+    let dur = now.elapsed().as_millis();
+    println!("took: {} ms",dur);
 
     if numerator / denominator > edge_voxel_percentage {
         while numerator / denominator > edge_voxel_percentage {
@@ -498,14 +648,13 @@ fn gradient_weighting(magnitude:&Array3<f32>, mask:&Array3<bool>, voxel_size:[f3
     }
     println!("n_iter = {}",iter);
     grad.map(|&x| x <= field_noise_level)
-
     
 }
 
 #[test]
 fn test_gradient_weighting() {
-    let magnitude = read_nifti_f32("/Users/Wyatt/scratch/qsm_work/test_inputs/magnitude.nii");
-    let mask = read_nifti_f32("/Users/Wyatt/scratch/qsm_work/test_inputs/mask_eroded.nii");
+    let magnitude = read_nifti_f32("/home/wyatt/test_data/qsm_test/magnitude.nii");
+    let mask = read_nifti_f32("/home/wyatt/test_data/qsm_test/mask_eroded.nii");
     let mask = mask.map(|&x| x.is_normal());
     let voxel_size = [1.,1.,1.];
     let now = Instant::now();
@@ -514,10 +663,17 @@ fn test_gradient_weighting() {
 
     let w_g = w_g.map(|&x| if x {1f32} else {0.});
     
-    write_nifti4d("/Users/Wyatt/scratch/qsm_work/test_inputs/rust_outputs/w_g",&w_g);
+    write_nifti4d("/home/wyatt/test_data/qsm_test/rust_outputs/w_g",&w_g);
     println!("took {} ms",dur);
 }
 
+#[test]
+fn test_dipole_kernel() {
+
+    let dk = fft::conv_kernels::dipole_kernel_3d([590,360,360], [0.,0.,1.], [1.,1.,1.]);
+    write_nifti("/home/wyatt/test_data/qsm_test/rust_outputs/dipole_kern", &dk.map(|x|x.re()));
+
+}
 
 
 
@@ -525,6 +681,12 @@ fn read_nifti_f32(nifti_base:impl AsRef<Path>) -> Array3<f32> {
     let nii = ReaderOptions::new();
     let vol = nii.read_file(nifti_base.as_ref()).unwrap().into_volume();
     vol.into_ndarray::<f32>().unwrap().into_dimensionality::<Ix3>().unwrap()
+}
+
+fn read_nifti_f32_4d(nifti_base:impl AsRef<Path>) -> Array4<f32> {
+    let nii = ReaderOptions::new();
+    let vol = nii.read_file(nifti_base.as_ref()).unwrap().into_volume();
+    vol.into_ndarray::<f32>().unwrap().into_dimensionality::<Ix4>().unwrap()
 }
 
 fn write_nifti(nifti_base:impl AsRef<Path>,vol:&Array3<f32>) {

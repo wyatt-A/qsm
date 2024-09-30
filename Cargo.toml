@@ -9,3 +9,5 @@ ndarray-linalg = { version = "0.15", features = ["openblas-system"] }
 fft = {path = "../civm_scan/fft"}
 num-complex = "0.4.4"
 nifti = "0.16.0"
+rayon = "1.10.0"
+rustfft = "6.2.0"
